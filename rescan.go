@@ -3,7 +3,6 @@
 package neutrino
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"sync"
@@ -19,6 +18,7 @@ import (
 	"github.com/btcsuite/btcutil"
 	"github.com/btcsuite/btcutil/gcs"
 	"github.com/btcsuite/btcutil/gcs/builder"
+
 	"github.com/lightninglabs/neutrino/blockntfns"
 	"github.com/lightninglabs/neutrino/headerfs"
 )
@@ -83,10 +83,11 @@ type rescanOptions struct {
 
 	endBlock *headerfs.BlockStamp
 
-	watchAddrs  []btcutil.Address
-	watchInputs []InputWithScript
-	watchList   [][]byte
-	txIdx       uint32
+	watchAddrs     map[string]btcutil.Address
+	watchInputs    map[string]InputWithScript
+	watchOutpoints map[wire.OutPoint]InputWithScript
+	watchList 	   [][]byte
+	txIdx     	   uint32
 
 	update <-chan *updateOptions
 	quit   <-chan struct{}
@@ -98,7 +99,11 @@ type rescanOptions struct {
 type RescanOption func(ro *rescanOptions)
 
 func defaultRescanOptions() *rescanOptions {
-	return &rescanOptions{}
+	return &rescanOptions{
+		watchInputs:    make(map[string]InputWithScript),
+		watchOutpoints: make(map[wire.OutPoint]InputWithScript),
+		watchAddrs:     make(map[string]btcutil.Address),
+	}
 }
 
 // QueryOptions pass onto the underlying queries.
@@ -157,7 +162,10 @@ func EndBlock(endBlock *headerfs.BlockStamp) RescanOption {
 // outpoint is added to the WatchOutPoints list.
 func WatchAddrs(watchAddrs ...btcutil.Address) RescanOption {
 	return func(ro *rescanOptions) {
-		ro.watchAddrs = append(ro.watchAddrs, watchAddrs...)
+		for _, addr := range watchAddrs {
+			pkScript, _ := txscript.PayToAddrScript(addr)
+			ro.watchAddrs[string(pkScript)] = addr
+		}
 	}
 }
 
@@ -178,7 +186,9 @@ type InputWithScript struct {
 // watched rather than replacing the list.
 func WatchInputs(watchInputs ...InputWithScript) RescanOption {
 	return func(ro *rescanOptions) {
-		ro.watchInputs = append(ro.watchInputs, watchInputs...)
+		for _, input := range watchInputs {
+			ro.watchInput(input)
+		}
 	}
 }
 
@@ -224,13 +234,8 @@ func rescan(chain ChainSource, options ...RescanOption) error {
 
 	// If we have something to watch, create a watch list. The watch list
 	// can be composed of a set of scripts, outpoints, and txids.
-	for _, addr := range ro.watchAddrs {
-		script, err := txscript.PayToAddrScript(addr)
-		if err != nil {
-			return err
-		}
-
-		ro.watchList = append(ro.watchList, script)
+	for script := range ro.watchAddrs {
+		ro.watchList = append(ro.watchList, []byte(script))
 	}
 	for _, input := range ro.watchInputs {
 		ro.watchList = append(ro.watchList, input.PkScript)
@@ -1005,13 +1010,18 @@ func blockFilterMatches(chain ChainSource, ro *rescanOptions,
 	return false, nil
 }
 
+func (ro *rescanOptions) watchInput(input InputWithScript) {
+	if input.OutPoint != zeroOutPoint {
+		ro.watchOutpoints[input.OutPoint] = input
+	} else {
+		ro.watchInputs[string(input.PkScript)] = input
+	}
+}
+
 // updateFilter atomically updates the filter and rewinds to the specified
 // height if not 0.
 func (ro *rescanOptions) updateFilter(chain ChainSource, update *updateOptions,
 	curStamp *headerfs.BlockStamp, curHeader *wire.BlockHeader) (bool, error) {
-
-	ro.watchAddrs = append(ro.watchAddrs, update.addrs...)
-	ro.watchInputs = append(ro.watchInputs, update.inputs...)
 
 	for _, addr := range update.addrs {
 		script, err := txscript.PayToAddrScript(addr)
@@ -1019,9 +1029,11 @@ func (ro *rescanOptions) updateFilter(chain ChainSource, update *updateOptions,
 			return false, err
 		}
 
+		ro.watchAddrs[string(script)] = addr
 		ro.watchList = append(ro.watchList, script)
 	}
 	for _, input := range update.inputs {
+		ro.watchInput(input)
 		ro.watchList = append(ro.watchList, input.PkScript)
 	}
 	for _, txid := range update.txIDs {
@@ -1077,24 +1089,20 @@ func (ro *rescanOptions) updateFilter(chain ChainSource, update *updateOptions,
 // spending a watched input.
 func (ro *rescanOptions) spendsWatchedInput(tx *btcutil.Tx) bool {
 	for _, in := range tx.MsgTx().TxIn {
-		for _, input := range ro.watchInputs {
-			switch {
-			// If we're watching for a zero outpoint, then we should
-			// match on the output script being spent instead.
-			case input.OutPoint == zeroOutPoint:
-				pkScript, err := txscript.ComputePkScript(
-					in.SignatureScript, in.Witness,
-				)
-				if err != nil {
-					continue
-				}
+		if _, ok := ro.watchOutpoints[in.PreviousOutPoint]; ok {
+			return true
+		}
 
-				if bytes.Equal(pkScript.Script(), input.PkScript) {
-					return true
-				}
+		if len(ro.watchInputs) > 0 {
 
-			// Otherwise, we'll match on the outpoint being spent.
-			case in.PreviousOutPoint == input.OutPoint:
+			pkScript, err := txscript.ComputePkScript(
+				in.SignatureScript, in.Witness,
+			)
+			if err != nil {
+				continue
+			}
+
+			if _, ok := ro.watchInputs[string(pkScript.Script())]; ok {
 				return true
 			}
 		}
@@ -1112,19 +1120,7 @@ txOutLoop:
 	for outIdx, out := range tx.MsgTx().TxOut {
 		pkScript := out.PkScript
 
-		for _, addr := range ro.watchAddrs {
-			// We'll convert the address into its matching pkScript
-			// to in order to check for a match.
-			addrScript, err := txscript.PayToAddrScript(addr)
-			if err != nil {
-				return false, err
-			}
-
-			// If the script doesn't match, we'll move onto the
-			// next one.
-			if !bytes.Equal(pkScript, addrScript) {
-				continue
-			}
+		if _, ok := ro.watchAddrs[string(pkScript)]; ok {
 
 			// At this state, we have a matching output so we'll
 			// mark this transaction as matching.
@@ -1138,7 +1134,7 @@ txOutLoop:
 				Hash:  *hash,
 				Index: uint32(outIdx),
 			}
-			ro.watchInputs = append(ro.watchInputs, InputWithScript{
+			ro.watchInput(InputWithScript{
 				PkScript: pkScript,
 				OutPoint: outPoint,
 			})
@@ -1352,12 +1348,22 @@ func (s *ChainService) GetUtxo(options ...RescanOption) (*SpendReport, error) {
 
 	// As this is meant to fetch UTXO's, the options MUST specify exactly
 	// one outpoint.
-	if len(ro.watchInputs) != 1 {
+	if len(ro.watchInputs) + len(ro.watchOutpoints) != 1 {
 		return nil, fmt.Errorf("must pass exactly one OutPoint")
 	}
 
+	var watchedInput InputWithScript
+	for _, input := range ro.watchInputs {
+		watchedInput = input
+		break
+	}
+	for _, input := range ro.watchOutpoints {
+		watchedInput = input
+		break
+	}
+
 	req, err := s.utxoScanner.Enqueue(
-		&ro.watchInputs[0], uint32(ro.startBlock.Height),
+		&watchedInput, uint32(ro.startBlock.Height),
 	)
 	if err != nil {
 		return nil, err
@@ -1368,7 +1374,7 @@ func (s *ChainService) GetUtxo(options ...RescanOption) (*SpendReport, error) {
 	report, err := req.Result(ro.quit)
 	if err != nil {
 		log.Debugf("Error finding spends for %s: %v",
-			ro.watchInputs[0].OutPoint.String(), err)
+			watchedInput.OutPoint.String(), err)
 		return nil, err
 	}
 
